@@ -5,7 +5,6 @@ Created on Thu Dec 18 13:59:31 2025
 @author: AsifurRahman
 """
 
-app_py = r'''
 import time
 import re
 import json
@@ -441,7 +440,8 @@ if "df_candidates" in st.session_state and not st.session_state["df_candidates"]
         st.subheader("Export")
         csv = df_out.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", data=csv, file_name="wg_directory_output.csv", mime="text/csv")
-'''
+
+
 
 
 
