@@ -5,12 +5,6 @@ Created on Thu Dec 18 13:59:31 2025
 @author: AsifurRahman
 """
 
-import os, zipfile
-from pathlib import Path
-
-base = Path("/mnt/data/wg_directory_indexer_v2_2")
-base.mkdir(parents=True, exist_ok=True)
-
 app_py = r'''
 import time
 import re
@@ -448,6 +442,7 @@ if "df_candidates" in st.session_state and not st.session_state["df_candidates"]
         csv = df_out.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", data=csv, file_name="wg_directory_output.csv", mime="text/csv")
 '''
+
 
 
 
