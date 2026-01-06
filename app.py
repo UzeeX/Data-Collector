@@ -449,22 +449,5 @@ if "df_candidates" in st.session_state and not st.session_state["df_candidates"]
         st.download_button("Download CSV", data=csv, file_name="wg_directory_output.csv", mime="text/csv")
 '''
 
-readme = r'''
-# WG Directory Builder (Useful v2.2)
 
-Main fix vs earlier versions:
-- Wood Gundy has two URL styles for team sites.
-- Team rosters are typically under:
-  https://woodgundyadvisors.cibc.com/web/<team-slug>/our-team
 
-v2.2 derives <team-slug> even if the team root is:
-  https://woodgundyadvisors.cibc.com/Team-Name/
-
-Outputs names + roles and the team/contact page URLs (no bulk email/phone harvesting).
-
-## Run (Windows cmd)
-```bat
-python -m venv venv
-venv\Scripts\activate.bat
-pip install -r requirements.txt
-python -m streamlit run app.py
