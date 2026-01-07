@@ -1,4 +1,3 @@
-```python
 # app.py
 import re
 import time
@@ -1502,3 +1501,4 @@ if "df_clean" in st.session_state:
 
     st.markdown('</div>', unsafe_allow_html=True)
 ```
+
