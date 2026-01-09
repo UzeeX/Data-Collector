@@ -1,7 +1,8 @@
 # app.py
 # IMPORTANT:
 # - Do NOT include any markdown backticks (```python) in this file.
-# - For Streamlit Cloud: add openpyxl in requirements.txt to enable Excel export (.xlsx).
+# - CSV cannot "autofit widths" (formatting isn't supported by CSV).
+# - For formatted export (autofit + team color banding + multi-sheets), use the Excel download.
 
 import re
 import time
@@ -29,7 +30,7 @@ except Exception:
 # =============================================================================
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Inovestor-Directory-Extractor/0.5.0",
+    "User-Agent": "Inovestor-Directory-Extractor/0.6.0",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
@@ -84,7 +85,7 @@ def same_domain(a: str, b: str) -> bool:
     return urlparse(a).netloc.lower() == urlparse(b).netloc.lower()
 
 def extract_links(html: str, base_url: str):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     out = []
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
@@ -96,7 +97,7 @@ def extract_links(html: str, base_url: str):
     return out
 
 def page_title(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     h1 = soup.find("h1")
     if h1 and h1.get_text(strip=True):
         return h1.get_text(" ", strip=True)
@@ -150,15 +151,14 @@ def polite_get(url: str, sleep_s: float = 0.75, timeout: int = 25, retries: int 
             r = SESSION.get(url, timeout=timeout, allow_redirects=True)
             r.raise_for_status()
 
-            # Fix accents: requests often defaults to ISO-8859-1
             enc = (r.encoding or "").lower()
             if not enc or enc == "iso-8859-1":
                 r.encoding = r.apparent_encoding or "utf-8"
 
             html = r.text
             final_url = r.url
-            _PAGE_CACHE[ukey] = (html, final_url)
 
+            _PAGE_CACHE[ukey] = (html, final_url)
             if len(_PAGE_CACHE) > 900:
                 _PAGE_CACHE.pop(next(iter(_PAGE_CACHE)))
 
@@ -291,27 +291,37 @@ def td_is_directory_page(soup: BeautifulSoup) -> bool:
     return has_advisors and has_teams
 
 def td_extract_links_under_heading(soup: BeautifulSoup, base_url: str, heading_set: set):
-    """Collect links under the heading block. Works for typical 'Advisors' / 'Teams' sections."""
+    """Collect TD roots under heading block (works for common directory layouts)."""
     for h in soup.find_all(["h2", "h3", "h4"]):
         ht = _norm_heading_text(h.get_text(" ", strip=True))
         if ht not in heading_set:
             continue
 
         links = []
-        for sib in h.find_next_siblings():
-            if getattr(sib, "name", None) in ["h2", "h3", "h4"]:
+        # Prefer "section container": the closest parent that contains many links
+        container = h
+        for _ in range(6):
+            if container.parent is None:
                 break
-            for a in sib.find_all("a", href=True):
-                t = a.get_text(" ", strip=True)
-                u = norm_url(urljoin(base_url, a.get("href")))
-                links.append((t, u))
+            container = container.parent
+            a_count = len(container.find_all("a", href=True))
+            if a_count >= 3:
+                break
 
-        # fallback: tabbed layouts sometimes break siblings, so scan further down
+        for a in container.find_all("a", href=True):
+            t = a.get_text(" ", strip=True)
+            u = norm_url(urljoin(base_url, a.get("href")))
+            links.append((t, u))
+
+        # fallback: scan after heading
         if not links:
-            for a in h.find_all_next("a", href=True, limit=450):
-                t = a.get_text(" ", strip=True)
-                u = norm_url(urljoin(base_url, a.get("href")))
-                links.append((t, u))
+            for sib in h.find_next_siblings():
+                if getattr(sib, "name", None) in ["h2", "h3", "h4"]:
+                    break
+                for a in sib.find_all("a", href=True):
+                    t = a.get_text(" ", strip=True)
+                    u = norm_url(urljoin(base_url, a.get("href")))
+                    links.append((t, u))
 
         out, seen = [], set()
         for t, u in links:
@@ -329,7 +339,7 @@ def td_extract_links_under_heading(soup: BeautifulSoup, base_url: str, heading_s
     return []
 
 def td_scan_all_one_segment_roots(html: str, base_url: str):
-    """Hard fallback: find all TD one-segment roots on the directory page."""
+    """Hard fallback: find all TD one-segment roots on the page."""
     links = extract_links(html, base_url)
     roots, seen = [], set()
 
@@ -354,7 +364,7 @@ def td_scan_all_one_segment_roots(html: str, base_url: str):
 
 def td_detect_single_root_kind(html: str) -> str:
     """Advisor profiles usually contain 'Part of / Fait partie de' link."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     for a in soup.find_all("a", href=True):
         t = a.get_text(" ", strip=True)
         if re.match(r"^(Part of|Fait partie de)\b", t, re.I):
@@ -362,7 +372,7 @@ def td_detect_single_root_kind(html: str) -> str:
     return "team"
 
 def td_extract_part_of_team(html: str, base_url: str):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     for a in soup.find_all("a", href=True):
         t = a.get_text(" ", strip=True)
         if re.match(r"^(Part of|Fait partie de)\b", t, re.I):
@@ -388,7 +398,7 @@ def td_guess_meet_the_team_url(root_final: str, sleep_s: float):
     return ""
 
 def td_extract_person_from_profile(html: str, base_url: str):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     h1 = soup.find("h1")
     if not h1:
         return None
@@ -397,7 +407,6 @@ def td_extract_person_from_profile(html: str, base_url: str):
     if not is_valid_person_name(name):
         return None
 
-    # Role (best-effort from nearby lines)
     lines = [x.strip() for x in soup.get_text("\n", strip=True).split("\n") if x.strip()]
     role_lines = []
     try:
@@ -414,7 +423,6 @@ def td_extract_person_from_profile(html: str, base_url: str):
             role_lines.append(line)
     role = " / ".join(dict.fromkeys(role_lines))[:120]
 
-    # Email
     emails = []
     for a in soup.select('a[href^="mailto:"]'):
         href = a.get("href", "")
@@ -426,7 +434,6 @@ def td_extract_person_from_profile(html: str, base_url: str):
             if m not in emails:
                 emails.append(m)
 
-    # Phones
     phones = []
     for a in soup.select('a[href^="tel:"]'):
         href = a.get("href", "")
@@ -438,7 +445,6 @@ def td_extract_person_from_profile(html: str, base_url: str):
             phones.append(m)
     phones = _normalize_phone_list(phones)
 
-    # Address
     address = ""
     text_lines = [x.strip() for x in soup.get_text("\n", strip=True).split("\n") if x.strip()]
     for i, line in enumerate(text_lines):
@@ -465,11 +471,8 @@ def td_extract_person_from_profile(html: str, base_url: str):
     }
 
 def td_extract_people_from_meet_page(html: str):
-    """
-    TD team roster pages are pretty unstructured; this parses "stripped_strings"
-    and groups blocks based on when a new valid name appears after contact info.
-    """
-    soup = BeautifulSoup(html, "html.parser")
+    """Parse TD roster page (best-effort) using stripped strings."""
+    soup = BeautifulSoup(html, "lxml")
     strings = [s.strip().replace("\u00A0", " ") for s in soup.stripped_strings if s and s.strip()]
 
     trimmed = []
@@ -496,21 +499,16 @@ def td_extract_people_from_meet_page(html: str):
             continue
         if s.lower() == "photo":
             continue
-
-        # new person boundary
         if cur and has_any_contact(cur) and looks_like_person_line(s):
             entries.append(cur)
             cur = [s]
             continue
-
         cur.append(s)
-
     if cur:
         entries.append(cur)
 
     people = []
     for buf in entries:
-        # name
         name = ""
         for x in buf:
             nm = clean_person_name(x)
@@ -520,21 +518,18 @@ def td_extract_people_from_meet_page(html: str):
         if not name:
             continue
 
-        # emails
         emails = []
         for x in buf:
             for m in EMAIL_RE.findall(x):
                 if m not in emails:
                     emails.append(m)
 
-        # phones
         phone_candidates = []
         for x in buf:
             for m in PHONE_RE.findall(x):
                 phone_candidates.append(m)
         phones = _normalize_phone_list(phone_candidates)
 
-        # role (lines after name until contact)
         role_lines, hit_name = [], False
         for x in buf:
             if clean_person_name(x) == name:
@@ -546,7 +541,6 @@ def td_extract_people_from_meet_page(html: str):
                 break
             if is_likely_role(x, name):
                 role_lines.append(x)
-
         role = " / ".join(dict.fromkeys(role_lines))[:120]
 
         people.append({
@@ -559,7 +553,6 @@ def td_extract_people_from_meet_page(html: str):
             "source": "td_meet_the_team",
         })
 
-    # de-dupe within roster page
     seen, out = set(), []
     for p in people:
         key = (_first_email(p.get("advisor_email")) or canon_name(p.get("advisor_name") or ""))
@@ -580,7 +573,6 @@ def td_fetch_people(url: str, sleep_s: float):
     if p:
         return [p], final_url
 
-    # last chance: roster parser if page text suggests it
     low = html.lower()
     if ("meet the team" in low) or ("rencontrez l" in low) or ("rencontrez l’équipe" in low) or ("rencontrez l'equipe" in low):
         roster = td_extract_people_from_meet_page(html)
@@ -590,14 +582,9 @@ def td_fetch_people(url: str, sleep_s: float):
     return [], final_url
 
 def discover_td_targets(seed_url: str, sleep_s: float):
-    """
-    TD directory pages have 2 sections: Advisors + Teams.
-    We collect both lists, then later:
-      - crawl each advisor profile
-      - crawl each team roster
-    """
+    """TD directory pages usually have 2 sections: Advisors + Teams."""
     html, final_url = polite_get(seed_url, sleep_s=sleep_s)
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
 
     if td_is_directory_page(soup):
         advisors = td_extract_links_under_heading(
@@ -609,21 +596,21 @@ def discover_td_targets(seed_url: str, sleep_s: float):
 
         rows = []
         for t, u in advisors:
-            rows.append({"branch_seed_url": seed_url, "target_url": u, "link_text": t, "td_kind": "advisor"})
+            rows.append({"branch_seed_url": seed_url, "target_url": u, "link_text": t, "kind": "td_advisor"})
         for t, u in teams:
-            rows.append({"branch_seed_url": seed_url, "target_url": u, "link_text": t, "td_kind": "team"})
+            rows.append({"branch_seed_url": seed_url, "target_url": u, "link_text": t, "kind": "td_team"})
 
         df = pd.DataFrame(rows)
         if not df.empty:
-            return df.drop_duplicates(subset=["target_url", "td_kind"]).reset_index(drop=True)
+            return df.drop_duplicates(subset=["target_url", "kind"]).reset_index(drop=True)
 
-    # fallback: grab all TD roots and infer kind later
+    # fallback
     roots = td_scan_all_one_segment_roots(html, final_url)
-    df = pd.DataFrame([{"branch_seed_url": seed_url, "target_url": u, "link_text": t, "td_kind": ""} for t, u in roots])
+    df = pd.DataFrame([{"branch_seed_url": seed_url, "target_url": u, "link_text": t, "kind": "td_unknown"} for t, u in roots])
     if df.empty:
         root = td_root_from_any_td_url(final_url)
-        df = pd.DataFrame([{"branch_seed_url": seed_url, "target_url": root, "link_text": "seed", "td_kind": ""}])
-    return df.drop_duplicates(subset=["target_url"]).reset_index(drop=True)
+        df = pd.DataFrame([{"branch_seed_url": seed_url, "target_url": root, "link_text": "seed", "kind": "td_unknown"}])
+    return df.drop_duplicates(subset=["target_url", "kind"]).reset_index(drop=True)
 
 
 # =============================================================================
@@ -632,13 +619,13 @@ def discover_td_targets(seed_url: str, sleep_s: float):
 
 DESJARDINS_TEAM_LINK_RE = re.compile(r"/find-us/desjardins-securities-team/[^/?#]+\.html$", re.I)
 
-def discover_desjardins_team_pages(seed_url: str, sleep_s: float):
+def discover_desjardins_targets(seed_url: str, sleep_s: float):
     html, final_url = polite_get(seed_url, sleep_s=sleep_s)
     links = extract_links(html, final_url)
 
     candidates = []
     if DESJARDINS_TEAM_LINK_RE.search(urlparse(final_url).path):
-        candidates.append({"branch_seed_url": seed_url, "target_url": norm_url(final_url), "link_text": "seed", "td_kind": ""})
+        candidates.append({"branch_seed_url": seed_url, "target_url": norm_url(final_url), "link_text": "seed", "kind": "desjardins_team"})
 
     for text, u in links:
         if not is_desjardins_url(u):
@@ -648,16 +635,16 @@ def discover_desjardins_team_pages(seed_url: str, sleep_s: float):
         t = (text or "").strip()
         if t.lower().startswith("view profile") or t.lower().startswith("voir le profil"):
             continue
-        candidates.append({"branch_seed_url": seed_url, "target_url": norm_url(u), "link_text": t or u, "td_kind": ""})
+        candidates.append({"branch_seed_url": seed_url, "target_url": norm_url(u), "link_text": t or u, "kind": "desjardins_team"})
 
     df = pd.DataFrame(candidates)
     if df.empty:
-        return pd.DataFrame(columns=["branch_seed_url", "target_url", "link_text", "td_kind"])
-    return df.drop_duplicates(subset=["target_url"]).reset_index(drop=True)
+        return pd.DataFrame(columns=["branch_seed_url", "target_url", "link_text", "kind"])
+    return df.drop_duplicates(subset=["target_url", "kind"]).reset_index(drop=True)
 
 
 # =============================================================================
-# CIBC Wood Gundy discovery support + common discover
+# CIBC Wood Gundy discovery support + generic discover
 # =============================================================================
 
 def branch_slug_from_url(url: str) -> str:
@@ -685,7 +672,7 @@ def discover_targets_from_seed(seed_url: str, sleep_s: float):
         return discover_td_targets(seed_url, sleep_s=sleep_s)
 
     if is_desjardins_url(seed_url):
-        return discover_desjardins_team_pages(seed_url, sleep_s=sleep_s)
+        return discover_desjardins_targets(seed_url, sleep_s=sleep_s)
 
     # CIBC WG: discover team roots from the teams hub page
     html, final_url = polite_get(seed_url, sleep_s=sleep_s)
@@ -704,12 +691,12 @@ def discover_targets_from_seed(seed_url: str, sleep_s: float):
         if not same_domain(u, final_url):
             continue
         if is_true_team_root(u, branch_slug):
-            candidates.append({"branch_seed_url": seed_url, "target_url": u, "link_text": text, "td_kind": ""})
+            candidates.append({"branch_seed_url": seed_url, "target_url": u, "link_text": text, "kind": "cibc_team"})
 
     df = pd.DataFrame(candidates)
     if df.empty:
-        return pd.DataFrame(columns=["branch_seed_url", "target_url", "link_text", "td_kind"])
-    return df.drop_duplicates(subset=["target_url"]).reset_index(drop=True)
+        return pd.DataFrame(columns=["branch_seed_url", "target_url", "link_text", "kind"])
+    return df.drop_duplicates(subset=["target_url", "kind"]).reset_index(drop=True)
 # =============================================================================
 # Slug helper (internal; NOT exported)
 # =============================================================================
@@ -737,6 +724,36 @@ def to_team_slug(team_root_url: str) -> str:
     seg = re.sub(r"[^A-Za-z0-9\-]+", "-", seg)
     seg = re.sub(r"-{2,}", "-", seg).strip("-")
     return seg.lower()
+
+
+# =============================================================================
+# CIBC: fix team name + better role parsing
+# =============================================================================
+
+CIBC_GENERIC_TITLES = {
+    "accueil", "home", "our team", "notre équipe", "notre equipe",
+    "contact", "services", "produits", "products"
+}
+
+def pretty_from_slug(slug: str) -> str:
+    s = (slug or "").strip("/").replace("-", " ").replace("_", " ").strip()
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.title()
+
+def choose_cibc_team_name(page_title_value: str, slug: str, link_text: str) -> str:
+    lt = (link_text or "").strip()
+    pv = (page_title_value or "").strip()
+
+    # 1) best: directory link text
+    if lt and lt.lower() not in {"seed"} and lt.strip().lower() not in CIBC_GENERIC_TITLES:
+        return lt
+
+    # 2) page title if not generic
+    if pv and pv.strip().lower() not in CIBC_GENERIC_TITLES:
+        return pv
+
+    # 3) fallback: from slug
+    return pretty_from_slug(slug)
 
 
 # =============================================================================
@@ -771,18 +788,19 @@ def extract_contact_from_block(block: BeautifulSoup):
             if m not in emails:
                 emails.append(m)
 
-    phones = []
+    phone_candidates = []
     for a in block.select('a[href^="tel:"]'):
         href = a.get("href", "")
         p = href.split("tel:", 1)[-1].strip()
-        if p and p not in phones:
-            phones.append(p)
-    if not phones:
+        if p:
+            phone_candidates.append(p)
+
+    if not phone_candidates:
         txt = block.get_text(" ", strip=True)
         for m in PHONE_RE.findall(txt):
-            m = re.sub(r"\s+", " ", m).strip()
-            if m and m not in phones:
-                phones.append(m)
+            phone_candidates.append(m)
+
+    phones = _normalize_phone_list(phone_candidates)
 
     address = ""
     txt_lines = [x.strip() for x in block.get_text("\n", strip=True).split("\n") if x.strip()]
@@ -795,12 +813,12 @@ def extract_contact_from_block(block: BeautifulSoup):
 
     return {
         "advisor_email": "; ".join(emails[:3]),
-        "advisor_phone": "; ".join(_normalize_phone_list(phones)[:3]),
+        "advisor_phone": "; ".join(phones[:3]),
         "advisor_address": address
     }
 
 def extract_people_from_page(html: str, base_url: str):
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, "lxml")
     people = []
 
     for h in soup.find_all(["h2", "h3", "h4", "h5"]):
@@ -810,7 +828,7 @@ def extract_people_from_page(html: str, base_url: str):
             continue
 
         block = h
-        for _ in range(4):
+        for _ in range(5):
             if block.parent is None:
                 break
             block = block.parent
@@ -818,13 +836,14 @@ def extract_people_from_page(html: str, base_url: str):
                 break
 
         role = ""
-        for sib in h.find_next_siblings(limit=6):
+        for sib in h.find_next_siblings(limit=8):
             txt = sib.get_text(" ", strip=True)
             if is_likely_role(txt, name):
                 role = txt
                 break
 
         contact = extract_contact_from_block(block)
+
         profile_url = ""
         a = h.find("a", href=True)
         if a:
@@ -849,13 +868,144 @@ def extract_people_from_page(html: str, base_url: str):
         out.append(p)
     return out
 
+
+# =============================================================================
+# CIBC people extraction (card-based around mailto/tel)
+# =============================================================================
+
+def _role_soft(text: str, person_name: str = "") -> bool:
+    if not text:
+        return False
+    t = re.sub(r"\s+", " ", text).strip(" -|•·")
+    if len(t) < 2 or len(t) > 120:
+        return False
+    if EMAIL_RE.search(t) or PHONE_RE.search(t):
+        return False
+    if person_name and _canon(t) == _canon(person_name):
+        return False
+    tl = t.lower()
+    if tl in JUNK_PHRASES or tl in CIBC_GENERIC_TITLES:
+        return False
+    if not re.search(r"[A-Za-zÀ-ÿ]", t):
+        return False
+    if len(t.split()) < 2:
+        return False
+    return True
+
+def _nearest_contact_card(node):
+    cur = node
+    for _ in range(12):
+        if cur is None:
+            break
+        if getattr(cur, "name", None) in ("div", "li", "section", "article"):
+            txt = cur.get_text(" ", strip=True)
+            if 40 <= len(txt) <= 1400:
+                if cur.select_one('a[href^="mailto:"]') or cur.select_one('a[href^="tel:"]'):
+                    return cur
+        cur = cur.parent
+    return node.parent if node else None
+
+def extract_people_from_cibc(html: str, base_url: str):
+    soup = BeautifulSoup(html, "lxml")
+    people = []
+
+    mailtos = soup.select('a[href^="mailto:"]')
+    if not mailtos:
+        return []
+
+    for a in mailtos:
+        href = a.get("href", "")
+        email = href.split("mailto:", 1)[-1].split("?", 1)[0].strip()
+        if not email:
+            continue
+
+        card = _nearest_contact_card(a)
+        if card is None:
+            continue
+
+        # name: prefer headings/strong
+        name = ""
+        for tag in card.find_all(["h1", "h2", "h3", "h4", "strong"], limit=16):
+            nm = clean_person_name(tag.get_text(" ", strip=True))
+            if is_valid_person_name(nm):
+                name = nm
+                break
+
+        if not name:
+            lines = [x.strip() for x in card.get_text("\n", strip=True).split("\n") if x.strip()]
+            for line in lines[:16]:
+                nm = clean_person_name(line)
+                if is_valid_person_name(nm):
+                    name = nm
+                    break
+        if not name:
+            continue
+
+        # phones
+        phone_candidates = []
+        for t in card.select('a[href^="tel:"]'):
+            ph = (t.get("href", "").split("tel:", 1)[-1] or "").strip()
+            if ph:
+                phone_candidates.append(ph)
+        if not phone_candidates:
+            phone_candidates += PHONE_RE.findall(card.get_text(" ", strip=True))
+        phones = _normalize_phone_list(phone_candidates)
+
+        # role: lines after name, before contact
+        role = ""
+        lines = [x.strip() for x in card.get_text("\n", strip=True).split("\n") if x.strip()]
+        idx = -1
+        for i, line in enumerate(lines):
+            if _canon(clean_person_name(line)) == _canon(name):
+                idx = i
+                break
+
+        for line in lines[idx + 1: idx + 14]:
+            if EMAIL_RE.search(line) or PHONE_RE.search(line):
+                break
+            if is_likely_role(line, name) or _role_soft(line, name):
+                role = line
+                break
+
+        people.append({
+            "advisor_name": name,
+            "advisor_role": role,
+            "advisor_email": email,
+            "advisor_phone": "; ".join(phones[:3]),
+            "advisor_address": "",
+            "advisor_profile_url": "",
+            "source": "cibc_card",
+        })
+
+    # De-dupe by email
+    seen, out = set(), []
+    for p in people:
+        k = (p.get("advisor_email") or "").lower().strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        out.append(p)
+    return out
+
+
+# =============================================================================
+# Fetch people (routes TD / CIBC / generic)
+# =============================================================================
+
 def fetch_people(url: str, sleep_s: float):
     if is_td_url(url):
         return td_fetch_people(url, sleep_s=sleep_s)
 
     html, final_url = polite_get(url, sleep_s=sleep_s)
-    people = extract_people_from_page(html, final_url)
-    return people, final_url
+
+    if is_cibc_wg_url(final_url):
+        people = extract_people_from_cibc(html, final_url)
+        if people:
+            return people, final_url
+        # fallback
+        return extract_people_from_page(html, final_url), final_url
+
+    return extract_people_from_page(html, final_url), final_url
 
 
 # =============================================================================
@@ -887,14 +1037,13 @@ def post_process_directory(df_out: pd.DataFrame, drop_no_contact=False) -> pd.Da
     if df.empty:
         return pd.DataFrame(columns=BASE_COLS)
 
-    # rank rows: keep richer info first
     def score_row(r):
         score = 0
         for c in ["advisor_email", "advisor_phone", "advisor_address", "advisor_profile_url"]:
             if str(r.get(c) or "").strip():
                 score += 1
         role = str(r.get("advisor_role") or "").strip()
-        if is_likely_role(role, str(r.get("advisor_name") or "")):
+        if is_likely_role(role, str(r.get("advisor_name") or "")) or _role_soft(role, str(r.get("advisor_name") or "")):
             score += 1
         return score
 
@@ -919,16 +1068,14 @@ def post_process_directory(df_out: pd.DataFrame, drop_no_contact=False) -> pd.Da
     for _, g in df.groupby("person_key", sort=False):
         base = g.iloc[0].to_dict()
 
-        # merge all team names into one cell (prevents duplicate lines)
         team_names = [str(x).strip() for x in g["team_name"].tolist() if str(x).strip()]
         base["team_name"] = "; ".join(dict.fromkeys(team_names))
 
-        # keep best info for contact fields
         for col in ["advisor_role", "advisor_email", "advisor_phone", "advisor_address", "advisor_profile_url"]:
             vals = [v for v in g[col].tolist() if pd.notna(v) and str(v).strip()]
             if col == "advisor_role":
                 nm = base.get("advisor_name", "")
-                vals = [v for v in vals if is_likely_role(str(v), nm)]
+                vals = [v for v in vals if is_likely_role(str(v), nm) or _role_soft(str(v), nm)]
             base[col] = vals[0] if vals else (base.get(col) or "")
 
         merged.append(base)
@@ -948,7 +1095,7 @@ def post_process_directory(df_out: pd.DataFrame, drop_no_contact=False) -> pd.Da
 
 # =============================================================================
 # Excel export (auto-fit + team banding + sheets per input link)
-# - Exported sheets DO NOT include branch_seed_url nor team_slug (your request)
+# - Exported sheets DO NOT include branch_seed_url nor team_slug
 # =============================================================================
 
 def _safe_sheet_name(name: str) -> str:
@@ -1014,14 +1161,12 @@ def build_styled_xlsx(df_full: pd.DataFrame, sheet_group_col: str, out_cols: lis
                 sdf[c] = ""
         sdf = sdf[out_cols].copy()
 
-        # header
         for col_idx, col_name in enumerate(out_cols, start=1):
             cell = ws.cell(row=1, column=col_idx, value=col_name)
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = header_align
 
-        # rows
         for r_idx, row in enumerate(sdf.itertuples(index=False), start=2):
             for c_idx, value in enumerate(row, start=1):
                 cell = ws.cell(row=r_idx, column=c_idx, value="" if value is None else str(value))
@@ -1030,7 +1175,6 @@ def build_styled_xlsx(df_full: pd.DataFrame, sheet_group_col: str, out_cols: lis
         ws.freeze_panes = "A2"
         ws.row_dimensions[1].height = 22
 
-        # add Excel table
         if ws.max_row >= 2:
             ref = f"A1:{get_column_letter(ws.max_column)}{ws.max_row}"
             base_name = re.sub(r"[^A-Za-z0-9_]", "", f"Tbl_{ws.title}")[:22] or "Table"
@@ -1112,18 +1256,19 @@ header {visibility: hidden;}
 st.markdown('<p class="h1">AR Directory Extractor</p>', unsafe_allow_html=True)
 st.markdown(
     '<p class="sub">Collects publicly visible advisor contact info. '
-    '<b>TD directories:</b> pulls both <b>Advisors</b> + <b>Teams</b>, crawls profiles + rosters, then globally de-dupes people (no duplicate lines).</p>',
+    '<b>TD:</b> pulls both <b>Advisors</b> + <b>Teams</b>, crawls profiles + rosters, then globally de-dupes people (no duplicate lines). '
+    '<b>CIBC:</b> fixes team names (avoids “Accueil”) and extracts roles using card-based parsing.</p>',
     unsafe_allow_html=True
 )
-st.write("")
 
+st.write("")
 left, right = st.columns([2.15, 1], gap="large")
 
 with right:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### Settings")
     sleep_s = st.slider("Polite delay (seconds)", 0.25, 2.0, 0.75, 0.25)
-    max_targets = st.number_input("Max targets per run", 1, 600, 200, 10)
+    max_targets = st.number_input("Max targets per run", 1, 900, 260, 10)
     drop_no_contact = st.checkbox("Drop rows with no email AND no phone", value=False)
     if not HAS_OPENPYXL:
         st.caption("Excel export disabled (openpyxl missing). Add it to requirements.txt.")
@@ -1131,11 +1276,11 @@ with right:
 
 with left:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### 1) Paste branch URLs")
+    st.markdown("### 1) Paste seed URLs")
     seed_urls_text = st.text_area(
         "Seed URLs (one per line)",
         height=140,
-        placeholder="Example TD directory:\nhttps://advisors.td.com/montreal1/\n\nMultiple links supported (Excel creates 1 sheet per link)."
+        placeholder="Examples:\nhttps://advisors.td.com/montreal1/\nhttps://woodgundyadvisors.cibc.com/our-investment-advisors-and-their-teams/"
     )
     c1, c2 = st.columns([1, 1])
     discover_clicked = c1.button("Discover targets", type="primary", use_container_width=True)
@@ -1161,12 +1306,12 @@ if discover_clicked:
                     errors.append({"seed": s, "error": str(e)})
 
         df_candidates = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(
-            columns=["branch_seed_url", "target_url", "link_text", "td_kind"]
+            columns=["branch_seed_url", "target_url", "link_text", "kind"]
         )
-        if "td_kind" not in df_candidates.columns:
-            df_candidates["td_kind"] = ""
+        if "kind" not in df_candidates.columns:
+            df_candidates["kind"] = "unknown"
 
-        df_candidates = df_candidates.drop_duplicates(subset=["target_url", "td_kind"]).reset_index(drop=True)
+        df_candidates = df_candidates.drop_duplicates(subset=["target_url", "kind"]).reset_index(drop=True)
         df_candidates["include"] = True
 
         st.session_state["df_candidates"] = df_candidates
@@ -1178,6 +1323,7 @@ if "df_candidates" in st.session_state and not st.session_state["df_candidates"]
     st.write("")
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### 2) Select targets")
+
     dfc = st.session_state["df_candidates"].copy()
 
     a, b, c, _ = st.columns([1, 1, 1.2, 5])
@@ -1185,12 +1331,12 @@ if "df_candidates" in st.session_state and not st.session_state["df_candidates"]
         dfc["include"] = True
     if b.button("Select none"):
         dfc["include"] = False
-    if c.button("Keep first 150"):
+    if c.button("Keep first 200"):
         dfc["include"] = False
-        dfc.loc[:149, "include"] = True
+        dfc.loc[:199, "include"] = True
 
     edited = st.data_editor(
-        dfc[["include", "branch_seed_url", "target_url", "td_kind", "link_text"]],
+        dfc[["include", "branch_seed_url", "target_url", "kind", "link_text"]],
         use_container_width=True,
         num_rows="dynamic"
     )
@@ -1209,9 +1355,18 @@ else:
     edited = st.session_state["edited_candidates"].copy()
     chosen = edited[edited["include"] == True].head(int(max_targets)).copy()
 
-    # TD: process Advisors first, then Teams
-    order_map = {"advisor": 0, "team": 1, "": 2}
-    chosen["_ord"] = chosen.get("td_kind", "").astype(str).str.lower().map(order_map).fillna(2).astype(int)
+    # Order: TD advisors -> TD teams -> others
+    def _ord(kind):
+        k = (kind or "").lower()
+        if k == "td_advisor":
+            return 0
+        if k == "td_team":
+            return 1
+        if k.startswith("td_"):
+            return 2
+        return 3
+
+    chosen["_ord"] = chosen["kind"].apply(_ord)
     chosen = chosen.sort_values(["_ord", "branch_seed_url", "target_url"]).drop(columns=["_ord"], errors="ignore")
 
     m1, m2, m3 = st.columns(3)
@@ -1224,38 +1379,69 @@ else:
     if build_clicked:
         rows, errs = [], []
         prog = st.progress(0)
-        total = len(chosen)
+
+        # ---- TD queue expansion: if advisor profile reveals a team not in the list, crawl it too
+        tasks = chosen.to_dict("records")
+        queued = {(t.get("target_url", ""), t.get("kind", "")) for t in tasks}
+        processed = set()
+
+        i = 0
+        total_est = max(1, len(tasks))
 
         with st.spinner("Building directory..."):
-            for i, r in enumerate(chosen.itertuples(index=False), start=1):
-                try:
-                    td_kind = (getattr(r, "td_kind", "") or "").strip().lower()
-                    target_url = getattr(r, "target_url", "")
+            while i < len(tasks) and len(processed) < int(max_targets):
+                t = tasks[i]
+                i += 1
 
+                target_url = t.get("target_url", "")
+                kind = (t.get("kind") or "").lower()
+                seed = t.get("branch_seed_url", "")
+                link_text = t.get("link_text", "") or ""
+
+                key = (target_url, kind)
+                if key in processed:
+                    continue
+                processed.add(key)
+
+                try:
                     # ---------------- TD ----------------
                     if is_td_url(target_url):
                         root_html, root_final = polite_get(target_url, sleep_s=sleep_s)
 
-                        if not td_kind:
-                            td_kind = td_detect_single_root_kind(root_html)
+                        if kind == "td_unknown" or kind == "td_unk" or kind == "td" or not kind.startswith("td_"):
+                            inferred = td_detect_single_root_kind(root_html)
+                            kind = "td_advisor" if inferred == "advisor" else "td_team"
 
-                        team_slug = to_team_slug(root_final)
-                        team_name = page_title(root_html) or team_slug
+                        slug = to_team_slug(root_final)
+                        page_nm = page_title(root_html) or slug
 
-                        # Advisors: crawl profile
-                        if td_kind == "advisor":
+                        if kind == "td_advisor":
                             people, src = td_fetch_people(root_final, sleep_s=sleep_s)
                             team_aff_name, team_aff_root = td_extract_part_of_team(root_html, root_final)
+
+                            # enqueue the team if discovered and not already queued
                             if team_aff_root:
-                                team_name = team_aff_name or team_name
+                                qk = (team_aff_root, "td_team")
+                                if qk not in queued:
+                                    queued.add(qk)
+                                    tasks.append({
+                                        "branch_seed_url": seed,
+                                        "target_url": team_aff_root,
+                                        "kind": "td_team",
+                                        "link_text": team_aff_name or team_aff_root,
+                                    })
+                                    total_est = max(total_est, len(tasks))
+
+                            team_name = team_aff_name or page_nm
+                            team_root = team_aff_root or root_final
 
                             for p in people:
                                 rows.append({
-                                    "branch_seed_url": r.branch_seed_url,
-                                    "team_root_url": team_aff_root or root_final,
-                                    "team_slug": to_team_slug(team_aff_root or root_final),
+                                    "branch_seed_url": seed,
+                                    "team_root_url": team_root,
+                                    "team_slug": to_team_slug(team_root),
                                     "team_name": team_name,
-                                    "team_page_url": team_aff_root or root_final,
+                                    "team_page_url": team_root,
                                     "contact_page_url": "",
                                     "advisor_name": p.get("advisor_name", ""),
                                     "advisor_role": p.get("advisor_role", ""),
@@ -1267,7 +1453,6 @@ else:
                                     "source_page_used": src,
                                 })
 
-                        # Teams: crawl roster
                         else:
                             meet_url = td_guess_meet_the_team_url(root_final, sleep_s=sleep_s) or root_final
                             people, src = td_fetch_people(meet_url, sleep_s=sleep_s)
@@ -1276,10 +1461,10 @@ else:
 
                             for p in people:
                                 rows.append({
-                                    "branch_seed_url": r.branch_seed_url,
+                                    "branch_seed_url": seed,
                                     "team_root_url": root_final,
-                                    "team_slug": team_slug,
-                                    "team_name": team_name,
+                                    "team_slug": slug,
+                                    "team_name": page_nm,
                                     "team_page_url": meet_url,
                                     "contact_page_url": "",
                                     "advisor_name": p.get("advisor_name", ""),
@@ -1292,7 +1477,7 @@ else:
                                     "source_page_used": src,
                                 })
 
-                        prog.progress(min(1.0, i / max(1, total)))
+                        prog.progress(min(1.0, len(processed) / max(1, total_est)))
                         continue
 
                     # ---------------- Non-TD ----------------
@@ -1300,14 +1485,20 @@ else:
                     slug = to_team_slug(root_final)
                     team_name = page_title(html_root) or slug
 
+                    # CIBC: fix team name (avoid "Accueil") using the discovery link_text
+                    if is_cibc_wg_url(root_final):
+                        team_name = choose_cibc_team_name(team_name, slug, link_text)
+
                     links = extract_links(html_root, root_final)
                     team_page = find_best_link(links, root_final, TEAM_PAGE_TEXT_PAT)
                     contact_page = find_best_link(links, root_final, CONTACT_PAGE_TEXT_PAT)
 
+                    # Desjardins: team page contains roster/contact blocks
                     if is_desjardins_url(root_final):
                         team_page = root_final
                         contact_page = ""
 
+                    # CIBC: common “web/<slug>/our-team” fallback
                     if is_cibc_wg_url(root_final):
                         web_team_guess = f"https://woodgundyadvisors.cibc.com/web/{slug}/our-team"
                         web_contact_guess = f"https://woodgundyadvisors.cibc.com/web/{slug}/contact"
@@ -1339,7 +1530,7 @@ else:
                             if k in by_name:
                                 for fld in ["advisor_email", "advisor_phone", "advisor_address", "advisor_role", "advisor_profile_url"]:
                                     if fld == "advisor_role":
-                                        if (not by_name[k].get(fld)) and is_likely_role(cp.get(fld, ""), cp.get("advisor_name", "")):
+                                        if (not by_name[k].get(fld)) and (is_likely_role(cp.get(fld, ""), cp.get("advisor_name", "")) or _role_soft(cp.get(fld, ""), cp.get("advisor_name", ""))):
                                             by_name[k][fld] = cp.get(fld, "")
                                     else:
                                         if not by_name[k].get(fld) and cp.get(fld):
@@ -1353,7 +1544,7 @@ else:
 
                     for p in (people or [{}]):
                         rows.append({
-                            "branch_seed_url": r.branch_seed_url,
+                            "branch_seed_url": seed,
                             "team_root_url": root_final,
                             "team_slug": slug,
                             "team_name": team_name,
@@ -1370,9 +1561,9 @@ else:
                         })
 
                 except Exception as e:
-                    errs.append({"target_url": getattr(r, "target_url", ""), "error": str(e)})
+                    errs.append({"target_url": target_url, "error": str(e)})
 
-                prog.progress(min(1.0, i / max(1, total)))
+                prog.progress(min(1.0, len(processed) / max(1, total_est)))
 
         df_out = pd.DataFrame(rows)
         df_clean = post_process_directory(df_out, drop_no_contact=drop_no_contact)
@@ -1411,7 +1602,7 @@ if "df_clean" in st.session_state:
 
     st.dataframe(df_export, use_container_width=True, height=420)
 
-    # CSV (UTF-8 BOM so French accents render correctly in Excel)
+    # CSV (UTF-8 BOM for Excel accents)
     csv_bytes = df_export.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
         "Download CSV (UTF-8)",
@@ -1421,7 +1612,7 @@ if "df_clean" in st.session_state:
         use_container_width=True
     )
 
-    # Excel: auto-fit + team banding + one sheet per input link
+    # Excel: auto-fit + team banding + one sheet per input seed URL
     if HAS_OPENPYXL:
         df_excel_full = df_clean.copy()
         if "branch_seed_url" not in df_excel_full.columns:
@@ -1431,7 +1622,7 @@ if "df_clean" in st.session_state:
             xlsx_bytes = build_styled_xlsx(
                 df_full=df_excel_full,
                 sheet_group_col="branch_seed_url",
-                out_cols=OUT_COLS,      # no branch_seed_url, no team_slug
+                out_cols=OUT_COLS,       # excludes branch_seed_url and team_slug
                 band_by_col="team_name"
             )
             st.download_button(
